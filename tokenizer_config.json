@@ -1,0 +1,13 @@
+{
+  "add_bos_token": false,
+  "add_eos_token": false,
+  "add_prefix_space": false,
+  "bos_token": "<s>",
+  "eos_token": "<|endoftext|>",
+  "pad_token": "<pad>",
+  "unk_token": "<unk>",
+  "model_max_length": 2048,
+  "tokenizer_class": "GPT2Tokenizer",
+  "clean_up_tokenization_spaces": true,
+  "chat_template": "{% for message in messages %}{% if message['role'] == 'system' %}{{ message['content'] + '\n\n' }}{% elif message['role'] == 'user' %}{{ 'Вопрос: ' + message['content'] + '\n\nОтвет: ' }}{% elif message['role'] == 'assistant' %}{{ message['content'] + eos_token }}{% endif %}{% endfor %}{% if add_generation_prompt %}{% endif %}"
+}

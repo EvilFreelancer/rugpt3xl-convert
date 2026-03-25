@@ -1,0 +1,30 @@
+{
+  "architectures": [
+    "RuGPT3XLForCausalLM"
+  ],
+  "auto_map": {
+    "AutoConfig": "configuration_rugpt3xl.RuGPT3XLConfig",
+    "AutoModel": "modeling_rugpt3xl.RuGPT3XLModel",
+    "AutoModelForCausalLM": "modeling_rugpt3xl.RuGPT3XLForCausalLM"
+  },
+  "model_type": "rugpt3xl",
+  "vocab_size": 50264,
+  "hidden_size": 2048,
+  "num_hidden_layers": 24,
+  "num_attention_heads": 16,
+  "intermediate_size": 8192,
+  "hidden_act": "gelu_new",
+  "max_position_embeddings": 2048,
+  "initializer_range": 0.02,
+  "layer_norm_eps": 1e-5,
+  "embedding_dropout": 0.1,
+  "attention_dropout": 0.1,
+  "output_dropout": 0.1,
+  "use_cache": true,
+  "bos_token_id": 2,
+  "eos_token_id": 1,
+  "pad_token_id": 0,
+  "tie_word_embeddings": false,
+  "torch_dtype": "float16",
+  "transformers_version": "5.3.0"
+}
