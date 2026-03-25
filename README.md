@@ -287,3 +287,7 @@ registered in the `transformers` library.
 - [HuggingFace Transformers](https://github.com/huggingface/transformers) - target framework
 - [HuggingFace Safetensors](https://github.com/huggingface/safetensors) - safe tensor serialization format
 - [GPT-3 Paper](https://arxiv.org/abs/2005.14165) - "Language Models are Few-Shot Learners" (Brown et al., 2020)
+
+## License
+
+This project is licensed under the MIT License, see the [LICENSE](LICENSE) file in the repository root for details.
