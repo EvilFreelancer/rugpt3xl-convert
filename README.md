@@ -280,13 +280,13 @@ registered in the `transformers` library.
 
 ## Links
 
+- [A family of pretrained transformer language models for Russian](https://scholar.google.com/citations?view_op=view_citation&hl=en&user=yPayeJIAAAAJ&citation_for_view=yPayeJIAAAAJ:Se3iqnhoufwC) - paper on Google Scholar
 - [ai-forever/rugpt3xl](https://huggingface.co/ai-forever/rugpt3xl) - original model on HuggingFace
 - [ai-forever/ru-gpts](https://github.com/ai-forever/ru-gpts) - original training codebase (Megatron-LM + DeepSpeed wrappers)
 - [NVIDIA/Megatron-LM](https://github.com/NVIDIA/Megatron-LM) - Megatron-LM framework used for training
 - [microsoft/DeepSpeed](https://github.com/microsoft/DeepSpeed) - DeepSpeed framework used for sparse attention
 - [HuggingFace Transformers](https://github.com/huggingface/transformers) - target framework
 - [HuggingFace Safetensors](https://github.com/huggingface/safetensors) - safe tensor serialization format
-- [GPT-3 Paper](https://arxiv.org/abs/2005.14165) - "Language Models are Few-Shot Learners" (Brown et al., 2020)
 
 ## License
 
