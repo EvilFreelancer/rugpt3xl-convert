@@ -35,6 +35,11 @@ class RuGPT3XLConfig(PretrainedConfig):
         eos_token_id=1,
         pad_token_id=0,
         tie_word_embeddings=False,
+        sparse_mode="none",
+        sparse_block_size=16,
+        sparse_num_local_blocks=8,
+        sparse_num_global_blocks=1,
+        sparse_num_different_global_patterns=8,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -50,6 +55,11 @@ class RuGPT3XLConfig(PretrainedConfig):
         self.attention_dropout = attention_dropout
         self.output_dropout = output_dropout
         self.use_cache = use_cache
+        self.sparse_mode = sparse_mode
+        self.sparse_block_size = sparse_block_size
+        self.sparse_num_local_blocks = sparse_num_local_blocks
+        self.sparse_num_global_blocks = sparse_num_global_blocks
+        self.sparse_num_different_global_patterns = sparse_num_different_global_patterns
 
         super().__init__(
             bos_token_id=bos_token_id,
