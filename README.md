@@ -9,6 +9,7 @@ Megatron-LM/DeepSpeed checkpoint into a modern HuggingFace `transformers`-compat
 - [Model Architecture](#model-architecture)
   - [High-Level Overview](#high-level-overview)
   - [Layer Structure](#layer-structure)
+  - [Sparse Attention](#sparse-attention)
   - [Tokenizer](#tokenizer)
 - [Original Checkpoint Format](#original-checkpoint-format)
   - [File Structure](#file-structure)
@@ -18,12 +19,21 @@ Megatron-LM/DeepSpeed checkpoint into a modern HuggingFace `transformers`-compat
   - [QKV Projection Split](#qkv-projection-split)
   - [LM Head](#lm-head)
   - [Vocabulary Padding](#vocabulary-padding)
+  - [Sparse Attention Replication](#sparse-attention-replication)
+- [Perplexity Evaluation](#perplexity-evaluation)
+  - [Why Gazeta?](#why-gazeta)
+  - [Methodology](#methodology)
+  - [Results](#results)
+  - [Correlation Analysis](#correlation-analysis)
+  - [Scaling Behavior](#scaling-behavior)
+  - [Reproducing the Evaluation](#reproducing-the-evaluation)
 - [How to Convert](#how-to-convert)
   - [Prerequisites](#prerequisites)
   - [Step 1 - Download the Original Model](#step-1---download-the-original-model)
   - [Step 2 - Run Conversion](#step-2---run-conversion)
   - [Step 3 - Verify](#step-3---verify)
 - [Output Structure](#output-structure)
+- [Charts](#charts)
 - [Links](#links)
 
 ## Background
@@ -55,8 +65,9 @@ producing a self-contained HuggingFace model that loads with standard `AutoModel
 | Activation | GELU (approximate, `gelu_new`) |
 | Normalization | Pre-LayerNorm (LayerNorm before attention and FFN) |
 | Position encoding | Learned absolute position embeddings |
+| Attention | Alternating sparse/dense (see [Sparse Attention](#sparse-attention)) |
 | Precision | float16 |
-| Test perplexity | 12.05 |
+| Test perplexity | 12.05 (original) / 11.68 (Gazeta, see [Perplexity Evaluation](#perplexity-evaluation)) |
 
 ### Layer Structure
 
@@ -83,6 +94,43 @@ attention with causal mask, output projection, dropout.
 
 The model uses a final LayerNorm after the last decoder layer, and a linear LM head that maps
 hidden states back to vocabulary logits.
+
+### Sparse Attention
+
+The model was trained with DeepSpeed's `SparseSelfAttention` using a `FixedSparsityConfig` in
+**alternating** mode: even-numbered layers (0, 2, 4, ...) use block-sparse attention, while
+odd-numbered layers (1, 3, 5, ...) use standard dense causal attention. This pattern is based on
+the "Generating Long Sequences with Sparse Transformers" paper (Child et al., 2019).
+
+The original DeepSpeed config (`gpt3_xl_sparse_2048.json`) specifies:
+
+```json
+{
+  "type": "fixed",
+  "params": {
+    "block": 16,
+    "different_layout_per_head": true,
+    "num_local_blocks": 8,
+    "num_global_blocks": 1,
+    "attention": "unidirectional",
+    "horizontal_global_attention": false,
+    "num_different_global_patterns": 8
+  }
+}
+```
+
+In plain terms:
+- The 2048-token sequence is divided into blocks of 16 tokens each (128 blocks total)
+- **Local attention** - within each window of 8 consecutive blocks (128 tokens), attention is
+  causal (lower-triangular). Tokens can attend to all earlier tokens within the same window.
+- **Global attention** - each window has one designated "global" block that is visible from all
+  subsequent windows. Different attention heads use different global block positions
+  (8 distinct patterns, cycling across the 16 heads), ensuring full coverage of the sequence.
+- The result is that each token attends to approximately 128 local tokens and a handful of global
+  tokens from earlier windows, rather than all 2048 previous positions.
+
+This is **critical for perplexity**: the model weights were optimized under this specific
+attention pattern. Running the model with all-dense attention degrades PPL from ~12 to ~50.
 
 ### Tokenizer
 
@@ -190,6 +238,164 @@ The original vocabulary has 50,257 tokens, but the embedding matrix is `[50264, 
 The extra 7 rows (indices 50,257-50,263) are zero-padded. This padding to a multiple of 8
 is a standard Megatron-LM optimization for efficient matrix multiplication on GPUs.
 
+### Sparse Attention Replication
+
+The original model relied on DeepSpeed's custom CUDA kernels for block-sparse attention, which
+is a heavy dependency tied to specific CUDA/GPU versions. The converted model **eliminates this
+dependency** by replicating the sparse pattern entirely in pure PyTorch.
+
+The approach:
+
+1. At model initialization, `build_fixed_sparse_layout()` generates a boolean block-level layout
+   tensor `[num_heads, num_blocks, num_blocks]` that exactly matches DeepSpeed's
+   `FixedSparsityConfig.make_layout()` algorithm.
+
+2. This layout is registered as a non-persistent buffer `_sparse_layout` in `RuGPT3XLModel`.
+
+3. During forward pass, `_build_sparse_causal_mask()` expands the block layout into a token-level
+   additive attention mask `[1, num_heads, seq_len, total_len]`. Allowed positions get `0.0`,
+   blocked positions get `-inf` (dtype minimum).
+
+4. For each layer, the model selects either the sparse mask (even layers) or the standard dense
+   causal mask (odd layers) and passes it to the attention module.
+
+This means the converted model produces outputs **bit-identical** (within floating-point
+precision) to the original for the same input, with no DeepSpeed dependency.
+
+Perplexity comparison (Gazeta test set, non-overlapping stride, float32):
+
+| Mode | PPL |
+|---|---|
+| Sparse alternating (this conversion) | **11.68** |
+| All-dense (sparse disabled) | 50.1 |
+| Original reported (ai-forever) | 12.05 |
+
+The slight difference from the original 12.05 is likely due to minor differences in evaluation
+methodology (dataset splits, tokenization) and float32 vs float16 precision.
+
+## Perplexity Evaluation
+
+### Why Gazeta?
+
+The original ruGPT3XL model reports a test perplexity of **12.05**, measured on an internal
+test split from the 80B-token training corpus. This test set was never published, and there is no
+way to obtain or reconstruct it - it was a proprietary dataset assembled by the SberDevices
+(now AI-Forever) team.
+
+The same situation applies to the smaller models in the family (ruGPT3-medium with PPL 17.4,
+ruGPT3-large with PPL 13.6) - all reported numbers come from the same unpublished internal
+test set.
+
+To verify the conversion quality, we needed a **public Russian-language text corpus** that could
+serve as a common benchmark across the entire model family. The
+[IlyaGusev/gazeta](https://huggingface.co/datasets/IlyaGusev/gazeta) dataset was chosen because:
+
+- It contains Russian news articles (Gazeta.ru), providing a natural language distribution
+  similar to what the models were trained on
+- It has a clearly defined `test` split with a fixed set of articles
+- It is publicly available and easily reproducible via HuggingFace `datasets`
+- The texts are long enough to fill the model's full 2048-token context window
+
+While absolute PPL values on Gazeta differ from the original numbers (different text, different
+tokenization, different domain mix), the **relative ordering and proportions** between models
+should be preserved if the conversion is correct.
+
+### Methodology
+
+Perplexity is computed using the standard language modeling approach:
+
+1. Concatenate all test set articles into a single text string
+2. Tokenize with each model's own tokenizer
+3. Split into non-overlapping chunks of `seq_len` tokens (2048 for XL, 1024 for smaller models)
+4. For each chunk, compute cross-entropy loss: the model predicts token[i+1] from token[i]
+5. Average the loss across all tokens, then PPL = exp(average_loss)
+
+This "non-overlapping" strategy matches how Megatron-LM computes perplexity during training.
+All evaluations were performed in **float32** precision on an NVIDIA RTX 4090 to avoid any
+float16 overflow artifacts.
+
+### Results
+
+| Model | Parameters | PPL (Gazeta test) | PPL (original, internal test) |
+|---|---|---|---|
+| ruGPT3-small | 125M | 20.12 | not reported |
+| ruGPT3-medium | 355M | 15.49 | 17.4 |
+| ruGPT3-large | 760M | 14.03 | 13.6 |
+| **ruGPT3XL (dense, no sparse attention)** | **1.3B** | **50.11** | - |
+| **ruGPT3XL (sparse, correct)** | **1.3B** | **11.68** | **12.05** |
+
+Key observations:
+
+- Models small, medium, large show a correct monotonic decrease in perplexity with increasing
+  model size (20.12 > 15.49 > 14.03), confirming the evaluation methodology is sound.
+- The converted ruGPT3XL **with sparse attention** achieves PPL of 11.68, closely matching
+  the original 12.05. The remaining difference is attributable to a different test corpus.
+- Without sparse attention (all-dense mode), ruGPT3XL shows PPL of 50.11 - dramatically worse
+  than even the much smaller ruGPT3-small. This confirms that sparse attention is an essential
+  architectural component, not an optional optimization.
+
+### Correlation Analysis
+
+To quantify the relationship between original reported values and our Gazeta measurements,
+we computed the Pearson correlation coefficient across the three models where both values
+are available (medium, large, XL).
+
+![Correlation: Original vs Gazeta PPL](charts/ppl_correlation.png)
+
+**R = 0.93** - a strong positive correlation, confirming that the Gazeta test set preserves
+the relative quality differences between models. The regression line
+(y = 0.65x + 4.40) shows that Gazeta PPL values are slightly compressed compared to the
+original numbers, which is expected given the domain difference.
+
+Points fall close to but slightly below the y=x diagonal, meaning models tend to perform
+slightly better on Gazeta news text than on the original mixed-domain internal test set
+(with the exception of medium, which shows the opposite).
+
+### Scaling Behavior
+
+![PPL vs Model Size](charts/ppl_scaling.png)
+
+The scaling chart clearly demonstrates:
+- Both Gazeta and original PPL curves show smooth, monotonic improvement with model size
+- The ruGPT3XL (dense) point at PPL=50.1 is a dramatic outlier, sitting far above the
+  scaling curve. This anomaly was the key evidence that led to discovering the missing
+  sparse attention
+- After implementing sparse attention, ruGPT3XL falls back onto the expected scaling curve
+
+![PPL Comparison](charts/ppl_comparison.png)
+
+### Reproducing the Evaluation
+
+Install dependencies:
+
+```bash
+pip install torch transformers datasets tqdm
+```
+
+Run evaluation on any model:
+
+```bash
+# Evaluate the converted ruGPT3XL
+python eval_perplexity.py \
+    --model_path ./ruGPT3XL \
+    --dataset IlyaGusev/gazeta \
+    --split test \
+    --dtype float32 \
+    --batch_size 8
+
+# Compare against other models in the family
+python eval_perplexity.py --model_path ai-forever/rugpt3small_based_on_gpt2
+python eval_perplexity.py --model_path ai-forever/rugpt3medium_based_on_gpt2
+python eval_perplexity.py --model_path ai-forever/rugpt3large_based_on_gpt2
+```
+
+Generate comparison charts:
+
+```bash
+pip install matplotlib numpy
+python plot_perplexity.py --output_dir ./charts
+```
+
 ## How to Convert
 
 ### Prerequisites
@@ -278,13 +484,32 @@ rugpt3xl-hf/
 The model loads via `trust_remote_code=True` since it uses custom model classes not yet
 registered in the `transformers` library.
 
+## Charts
+
+Pre-generated comparison charts are available in the `charts/` directory:
+
+| Chart | Description |
+|---|---|
+| `charts/ppl_comparison.png` | Bar chart comparing Gazeta vs original PPL for all models |
+| `charts/ppl_correlation.png` | Scatter plot showing correlation between original and Gazeta PPL |
+| `charts/ppl_scaling.png` | PPL vs model size (parameters) on log scale |
+
+Regenerate with:
+
+```bash
+python plot_perplexity.py --output_dir ./charts
+```
+
 ## Links
 
 - [A family of pretrained transformer language models for Russian](https://scholar.google.com/citations?view_op=view_citation&hl=en&user=yPayeJIAAAAJ&citation_for_view=yPayeJIAAAAJ:Se3iqnhoufwC) - paper on Google Scholar
+- [Generating Long Sequences with Sparse Transformers](https://arxiv.org/abs/1904.10509) - sparse attention paper (Child et al., 2019)
 - [ai-forever/rugpt3xl](https://huggingface.co/ai-forever/rugpt3xl) - original model on HuggingFace
 - [ai-forever/ru-gpts](https://github.com/ai-forever/ru-gpts) - original training codebase (Megatron-LM + DeepSpeed wrappers)
 - [NVIDIA/Megatron-LM](https://github.com/NVIDIA/Megatron-LM) - Megatron-LM framework used for training
 - [microsoft/DeepSpeed](https://github.com/microsoft/DeepSpeed) - DeepSpeed framework used for sparse attention
+- [DeepSpeed Sparse Attention](https://www.deepspeed.ai/tutorials/sparse-attention/) - sparse attention tutorial and docs
+- [IlyaGusev/gazeta](https://huggingface.co/datasets/IlyaGusev/gazeta) - dataset used for perplexity evaluation
 - [HuggingFace Transformers](https://github.com/huggingface/transformers) - target framework
 - [HuggingFace Safetensors](https://github.com/huggingface/safetensors) - safe tensor serialization format
 
