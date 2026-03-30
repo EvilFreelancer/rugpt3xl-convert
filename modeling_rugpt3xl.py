@@ -15,6 +15,7 @@ import torch.utils.checkpoint
 
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
+from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
@@ -27,43 +28,40 @@ from .configuration_rugpt3xl import RuGPT3XLConfig
 logger = logging.get_logger(__name__)
 
 
-def build_fixed_sparse_layout(
+def _make_sparse_layout(
     num_heads: int,
     num_blocks: int,
     num_local_blocks: int,
     num_global_blocks: int,
     num_different_global_patterns: int,
+    device: torch.device,
 ) -> torch.Tensor:
-    """Replicate DeepSpeed FixedSparsityConfig.make_layout() for unidirectional attention.
+    """Build FixedSparsity boolean layout on *device*.
 
-    Returns a boolean tensor of shape [num_heads, num_blocks, num_blocks] where
-    True means the query block can attend to the key block.
+    Returns [num_heads, num_blocks, num_blocks] bool tensor.
     """
-    layout = torch.zeros((num_heads, num_blocks, num_blocks), dtype=torch.bool)
+    layout = torch.zeros(
+        num_heads, num_blocks, num_blocks, dtype=torch.bool, device=device,
+    )
 
-    # Local attention within fixed-size windows (identical for all heads)
-    for window_start in range(0, num_blocks, num_local_blocks):
-        window_end = min(window_start + num_local_blocks, num_blocks)
-        window_size = window_end - window_start
-        layout[:, window_start:window_end, window_start:window_end] = torch.tril(
-            torch.ones(window_size, window_size, dtype=torch.bool)
+    for win in range(0, num_blocks, num_local_blocks):
+        end = min(win + num_local_blocks, num_blocks)
+        sz = end - win
+        layout[:, win:end, win:end] = torch.tril(
+            torch.ones(sz, sz, dtype=torch.bool, device=device)
         )
 
     # Global attention (per-head: different heads use different global block positions)
     for h in range(num_heads):
-        first_global = num_local_blocks - (
+        first = num_local_blocks - (
             1 + h % num_different_global_patterns
         ) * num_global_blocks
-        regular_end = num_blocks - (num_blocks % num_local_blocks)
-
-        for gi in range(first_global, regular_end, num_local_blocks):
+        reg_end = num_blocks - (num_blocks % num_local_blocks)
+        for gi in range(first, reg_end, num_local_blocks):
             layout[h, gi:, gi : gi + num_global_blocks] = True
-
-        if regular_end < num_blocks:
-            start = min(
-                regular_end + first_global, num_blocks - num_global_blocks
-            )
-            layout[h, start:, start : start + num_global_blocks] = True
+        if reg_end < num_blocks:
+            s = min(reg_end + first, num_blocks - num_global_blocks)
+            layout[h, s:, s : s + num_global_blocks] = True
 
     return layout
 
@@ -242,6 +240,7 @@ class RuGPT3XLModel(RuGPT3XLPreTrainedModel):
         )
         self.norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
+        # Sparse attention config
         self._sparse_layers: set = set()
         if getattr(config, "sparse_mode", "none") == "alternating":
             self._sparse_layers = {
@@ -250,21 +249,29 @@ class RuGPT3XLModel(RuGPT3XLPreTrainedModel):
         elif getattr(config, "sparse_mode", "none") == "all":
             self._sparse_layers = set(range(config.num_hidden_layers))
 
-        if self._sparse_layers:
-            num_blocks = config.max_position_embeddings // config.sparse_block_size
-            layout = build_fixed_sparse_layout(
-                num_heads=config.num_attention_heads,
-                num_blocks=num_blocks,
-                num_local_blocks=config.sparse_num_local_blocks,
-                num_global_blocks=config.sparse_num_global_blocks,
-                num_different_global_patterns=config.sparse_num_different_global_patterns,
-            )
-            self.register_buffer("_sparse_layout", layout, persistent=False)
-        else:
-            self._sparse_layout = None
+        # Sparse layout will be lazily built on first forward.
+        # NOT registered as a buffer to avoid meta-device corruption.
+        self._sparse_layout: Optional[torch.Tensor] = None
 
         self.gradient_checkpointing = False
         self.post_init()
+
+    def _get_sparse_layout(self, device: torch.device) -> torch.Tensor:
+        """Return sparse layout tensor on *device*, building it if necessary."""
+        if self._sparse_layout is not None and self._sparse_layout.device == device:
+            return self._sparse_layout
+
+        cfg = self.config
+        num_blocks = cfg.max_position_embeddings // cfg.sparse_block_size
+        self._sparse_layout = _make_sparse_layout(
+            num_heads=cfg.num_attention_heads,
+            num_blocks=num_blocks,
+            num_local_blocks=cfg.sparse_num_local_blocks,
+            num_global_blocks=cfg.sparse_num_global_blocks,
+            num_different_global_patterns=cfg.sparse_num_different_global_patterns,
+            device=device,
+        )
+        return self._sparse_layout
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -302,14 +309,16 @@ class RuGPT3XLModel(RuGPT3XLPreTrainedModel):
 
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError(
-                "You cannot specify both input_ids and inputs_embeds at the same time"
+                "You cannot specify both input_ids and inputs_embeds"
             )
         if input_ids is not None:
             batch_size, seq_length = input_ids.shape[:2]
         elif inputs_embeds is not None:
             batch_size, seq_length = inputs_embeds.shape[:2]
         else:
-            raise ValueError("You have to specify either input_ids or inputs_embeds")
+            raise ValueError(
+                "You have to specify either input_ids or inputs_embeds"
+            )
 
         if self.gradient_checkpointing and self.training and use_cache:
             logger.warning_once(
@@ -325,14 +334,15 @@ class RuGPT3XLModel(RuGPT3XLPreTrainedModel):
             past_key_values_length = past_key_values.get_seq_length()
 
         if position_ids is None:
-            device = input_ids.device if input_ids is not None else inputs_embeds.device
+            device = (
+                input_ids.device if input_ids is not None else inputs_embeds.device
+            )
             position_ids = torch.arange(
                 past_key_values_length,
                 seq_length + past_key_values_length,
                 dtype=torch.long,
                 device=device,
-            )
-            position_ids = position_ids.unsqueeze(0)
+            ).unsqueeze(0)
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -340,7 +350,7 @@ class RuGPT3XLModel(RuGPT3XLPreTrainedModel):
         position_embeds = self.embed_positions(position_ids)
         hidden_states = self.embed_dropout(inputs_embeds + position_embeds)
 
-        # Build causal 4D attention mask (dense layers)
+        # Dense causal mask
         causal_mask = self._build_causal_mask(
             batch_size,
             seq_length,
@@ -350,15 +360,16 @@ class RuGPT3XLModel(RuGPT3XLPreTrainedModel):
             attention_mask,
         )
 
-        # Build sparse causal mask (sparse layers)
+        # Sparse causal mask (lazily build layout on correct device)
         sparse_mask = None
-        if self._sparse_layout is not None and self._sparse_layers:
+        if self._sparse_layers:
+            sparse_layout = self._get_sparse_layout(hidden_states.device)
             sparse_mask = self._build_sparse_causal_mask(
                 seq_length,
                 past_key_values_length,
                 hidden_states.dtype,
                 hidden_states.device,
-                self._sparse_layout,
+                sparse_layout,
                 self.config.sparse_block_size,
                 attention_mask,
             )
@@ -399,7 +410,9 @@ class RuGPT3XLModel(RuGPT3XLPreTrainedModel):
 
             hidden_states = layer_outputs[0]
             if use_cache:
-                next_decoder_cache = layer_outputs[2 if output_attentions else 1]
+                next_decoder_cache = layer_outputs[
+                    2 if output_attentions else 1
+                ]
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
@@ -408,14 +421,17 @@ class RuGPT3XLModel(RuGPT3XLPreTrainedModel):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        next_cache = None
-        if use_cache:
-            next_cache = next_decoder_cache
+        next_cache = next_decoder_cache if use_cache else None
 
         if not return_dict:
             return tuple(
                 v
-                for v in [hidden_states, next_cache, all_hidden_states, all_self_attns]
+                for v in [
+                    hidden_states,
+                    next_cache,
+                    all_hidden_states,
+                    all_self_attns,
+                ]
                 if v is not None
             )
         return BaseModelOutputWithPast(
@@ -436,19 +452,24 @@ class RuGPT3XLModel(RuGPT3XLPreTrainedModel):
     ) -> torch.Tensor:
         total_length = past_length + seq_length
         causal = torch.full(
-            (seq_length, total_length), torch.finfo(dtype).min, device=device
+            (seq_length, total_length),
+            torch.finfo(dtype).min,
+            device=device,
         )
         causal = causal.masked_fill(
             torch.arange(total_length, device=device).unsqueeze(0)
-            <= torch.arange(past_length, past_length + seq_length, device=device).unsqueeze(1),
+            <= torch.arange(
+                past_length, past_length + seq_length, device=device
+            ).unsqueeze(1),
             0.0,
         )
         causal = causal.unsqueeze(0).unsqueeze(0)
 
         if attention_mask is not None:
-            pad_mask = (1 - attention_mask[:, None, None, :].to(dtype)) * torch.finfo(
-                dtype
-            ).min
+            pad_mask = (
+                (1 - attention_mask[:, None, None, :].to(dtype))
+                * torch.finfo(dtype).min
+            )
             causal = causal + pad_mask
 
         return causal
@@ -478,8 +499,7 @@ class RuGPT3XLModel(RuGPT3XLPreTrainedModel):
             torch.arange(total_length, device=device) // block_size
         ).clamp(max=num_blocks - 1)
 
-        layout_dev = sparse_layout.to(device)
-        block_ok = layout_dev[:, q_block][:, :, k_block]
+        block_ok = sparse_layout[:, q_block][:, :, k_block]
 
         q_pos = torch.arange(
             past_length, past_length + seq_length, device=device
@@ -490,8 +510,7 @@ class RuGPT3XLModel(RuGPT3XLPreTrainedModel):
         allowed = block_ok & causal_ok.unsqueeze(0)
 
         min_val = torch.finfo(dtype).min
-        mask = torch.where(allowed, 0.0, min_val).to(dtype)
-        mask = mask.unsqueeze(0)
+        mask = torch.where(allowed, 0.0, min_val).to(dtype).unsqueeze(0)
 
         if attention_mask is not None:
             pad_mask = (
@@ -502,8 +521,9 @@ class RuGPT3XLModel(RuGPT3XLPreTrainedModel):
         return mask
 
 
-class RuGPT3XLForCausalLM(RuGPT3XLPreTrainedModel):
+class RuGPT3XLForCausalLM(RuGPT3XLPreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+    _supports_cache_class = True
 
     def __init__(self, config: RuGPT3XLConfig):
         super().__init__(config)
@@ -604,8 +624,13 @@ class RuGPT3XLForCausalLM(RuGPT3XLPreTrainedModel):
     ):
         if past_key_values is not None:
             past_length = past_key_values.get_seq_length()
-            if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
-                input_ids = input_ids[:, -(attention_mask.shape[1] - past_length):]
+            if (
+                attention_mask is not None
+                and attention_mask.shape[1] > input_ids.shape[1]
+            ):
+                input_ids = input_ids[
+                    :, -(attention_mask.shape[1] - past_length) :
+                ]
             elif past_length < input_ids.shape[1]:
                 input_ids = input_ids[:, past_length:]
 
@@ -614,7 +639,7 @@ class RuGPT3XLForCausalLM(RuGPT3XLPreTrainedModel):
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
         if position_ids is not None and past_key_values is not None:
-            position_ids = position_ids[:, -input_ids.shape[1]:]
+            position_ids = position_ids[:, -input_ids.shape[1] :]
 
         if inputs_embeds is not None and past_key_values is None:
             model_inputs = {"inputs_embeds": inputs_embeds}
