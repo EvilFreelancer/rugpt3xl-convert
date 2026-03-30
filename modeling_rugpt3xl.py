@@ -2,7 +2,8 @@
 
 GPT-3-style decoder-only transformer (1.3B) trained on Russian text.
 Architecture: absolute position embeddings, pre-norm layers, GELU activation,
-tied LM head.
+tied LM head. Attention: config.attn_implementation "sdpa" uses
+scaled_dot_product_attention (Flash/Memory-efficient/Triton backends on CUDA).
 """
 
 import math
@@ -107,17 +108,37 @@ class RuGPT3XLAttention(nn.Module):
         if past_key_value is not None:
             key, value = past_key_value.update(key, value, self.layer_idx)
 
-        attn_weights = torch.matmul(query, key.transpose(2, 3)) * self.scale
+        attn_impl = getattr(self.config, "attn_implementation", "sdpa")
+        use_sdpa = attn_impl == "sdpa" and not output_attentions
 
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
+        if use_sdpa:
+            dropout_p = self.attn_dropout.p if self.training else 0.0
+            sdpa_mask = attention_mask
+            if sdpa_mask is not None:
+                sdpa_mask = sdpa_mask.to(dtype=query.dtype)
+            attn_output = F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=sdpa_mask,
+                dropout_p=dropout_p,
+                is_causal=False,
+            )
+            attn_weights = None
+        else:
+            attn_weights = torch.matmul(query, key.transpose(2, 3)) * self.scale
 
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
-            query.dtype
-        )
-        attn_weights = self.attn_dropout(attn_weights)
+            if attention_mask is not None:
+                attn_weights = attn_weights + attention_mask
 
-        attn_output = torch.matmul(attn_weights, value)
+            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
+                query.dtype
+            )
+            attn_weights = self.attn_dropout(attn_weights)
+
+            attn_output = torch.matmul(attn_weights, value)
+            attn_weights = attn_weights if output_attentions else None
+
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
 

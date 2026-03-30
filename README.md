@@ -27,6 +27,11 @@ Megatron-LM/DeepSpeed checkpoint into a modern HuggingFace `transformers`-compat
   - [Correlation Analysis](#correlation-analysis)
   - [Scaling Behavior](#scaling-behavior)
   - [Reproducing the Evaluation](#reproducing-the-evaluation)
+- [Training throughput (SDPA and Inductor)](#training-throughput-sdpa-and-inductor)
+  - [Motivation](#motivation)
+  - [What we implemented](#what-we-implemented)
+  - [Benchmark results (RTX 4090)](#benchmark-results-rtx-4090)
+  - [Running the benchmark](#running-the-benchmark)
 - [How to Convert](#how-to-convert)
   - [Prerequisites](#prerequisites)
   - [Step 1 - Download the Original Model](#step-1---download-the-original-model)
@@ -68,6 +73,8 @@ producing a self-contained HuggingFace model that loads with standard `AutoModel
 | Attention | Alternating sparse/dense (see [Sparse Attention](#sparse-attention)) |
 | Precision | float16 |
 | Test perplexity | 12.05 (original) / 11.68 (Gazeta, see [Perplexity Evaluation](#perplexity-evaluation)) |
+| `attn_implementation` (converted HF code) | `"sdpa"` by default (`F.scaled_dot_product_attention`, efficient CUDA backends); set `"eager"` for explicit matmul attention |
+| GPU training throughput | Optional Inductor `torch.compile` helper and synthetic benchmarks on RTX 4090 (see [Training throughput](#training-throughput-sdpa-and-inductor)) |
 
 ### Layer Structure
 
@@ -88,7 +95,10 @@ Output
 ```
 
 **Attention block**: Separate Q, K, V linear projections (each `[2048, 2048]`), scaled dot-product
-attention with causal mask, output projection, dropout.
+attention with causal (or sparse) additive mask, output projection, dropout. In the converted
+implementation, `config.attn_implementation="sdpa"` routes attention to `scaled_dot_product_attention`
+without changing the mathematical definition; use `"eager"` if you need full attention weight tensors
+or maximum compatibility with custom debugging.
 
 **FFN block**: Up-projection `[2048, 8192]` -> GELU -> Down-projection `[8192, 2048]` -> Dropout.
 
@@ -396,6 +406,69 @@ pip install matplotlib numpy
 python plot_perplexity.py --output_dir ./charts
 ```
 
+## Training throughput (SDPA and Inductor)
+
+The converted model originally implemented attention as explicit `matmul` + `softmax` + `matmul`
+in PyTorch eager mode. That is correct mathematically but leaves performance on the table compared
+to fused attention paths available on recent NVIDIA GPUs.
+
+### Motivation
+
+- **Faster fine-tuning and experiments** without changing weights or architecture. The goal is
+  implementation speed, not a new model definition.
+- **`scaled_dot_product_attention`** (PyTorch 2.x) dispatches to efficient CUDA backends where
+  available (including FlashAttention-style and memory-efficient attention; Inductor may emit
+  **Triton** kernels for surrounding ops).
+- **`torch.compile`** with the Inductor backend can fuse many pointwise ops and generate Triton
+  code for parts of the graph. Training loops need care (CUDA Graphs can conflict with optimizer
+  steps), so the helper disables Inductor CUDA graph trees for stability.
+
+None of this replaces the conversion story or sparse-mask logic. It only affects how the same
+tensor operations run on GPU.
+
+### What we implemented
+
+| Piece | Role |
+|---|---|
+| `RuGPT3XLConfig.attn_implementation` | `"sdpa"` (default) or `"eager"`. |
+| `RuGPT3XLAttention` | If `"sdpa"` and `output_attentions=False`, uses `F.scaled_dot_product_attention`. The additive mask is cast to `query.dtype` (required on some PyTorch builds). If `output_attentions=True`, falls back to eager to return full weights. |
+| `triton_utils.compile_rugpt3xl_for_triton` | Wraps `torch.compile`; sets `torch._inductor.config.triton.cudagraph_trees = False` to avoid CUDAGraph overwrite errors during `backward` + `optimizer.step()`. |
+| `benchmark_train_triton.py` | Synthetic LM training loop (AdamW, fp16), optional `--find-max-batch`, `--attn`, `--compile`. |
+
+### Benchmark results (RTX 4090)
+
+All numbers below are from a **synthetic** training loop (random `input_ids`, same tensor used as
+`labels`, AdamW, fp16, `use_cache=False`). They measure **throughput**, not convergence. Absolute
+`avg_loss` can be `NaN` in fp16 on random data; ignore it for timing.
+
+Hardware and stack (reference run): **NVIDIA GeForce RTX 4090**, PyTorch **2.11.0+cu130**, Triton
+available, `torch.backends.cuda.matmul.allow_tf32 = True`, `torch.set_float32_matmul_precision("high")`.
+
+| Mode | Approx. batch × seq | Throughput (tokens / sec) | Notes |
+|---|---:|---:|---|
+| `eager` | 2 × 2048 | ~6 280 | `--find-max-batch` (max stable batch for this setup). |
+| `sdpa` | 2 × 2048 | ~8 765 | Same batch size as eager row (apples-to-apples). |
+| `sdpa` | 5 × 2048 | ~9 250 | `--find-max-batch` with timed run using `max_batch - 1` to reduce post-search OOM. |
+| `sdpa` + `torch.compile` (`mode=default`) | 4 × 2048 | ~11 590 | Fixed batch; Inductor without CUDA graph trees on attention. |
+
+Rough takeaway at **batch 2 × 2048**: SDPA is on the order of **~40% higher** tokens/sec than eager
+on this stack. Compile adds more when memory allows a moderate batch size.
+
+### Running the benchmark
+
+From this directory (with a converted checkpoint in `./ruGPT3XL` or set `--model-path`):
+
+```bash
+pip install torch transformers
+
+# Apples-to-apples SDPA vs eager at fixed shape
+python benchmark_train_triton.py --model-path ./ruGPT3XL --device cuda:0 --seq-len 2048 --batch-size 2 --attn sdpa
+python benchmark_train_triton.py --model-path ./ruGPT3XL --device cuda:0 --seq-len 2048 --batch-size 2 --attn eager
+
+# Optional: torch.compile (may take noticeable time on first steps)
+python benchmark_train_triton.py --model-path ./ruGPT3XL --device cuda:0 --seq-len 2048 --batch-size 4 --attn sdpa --compile
+```
+
 ## How to Convert
 
 ### Prerequisites
@@ -516,3 +589,4 @@ python plot_perplexity.py --output_dir ./charts
 ## License
 
 This project is licensed under the MIT License, see the [LICENSE](LICENSE) file in the repository root for details.
+

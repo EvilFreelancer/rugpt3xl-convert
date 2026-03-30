@@ -40,6 +40,7 @@ class RuGPT3XLConfig(PretrainedConfig):
         sparse_num_local_blocks=8,
         sparse_num_global_blocks=1,
         sparse_num_different_global_patterns=8,
+        attn_implementation="sdpa",
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -60,6 +61,7 @@ class RuGPT3XLConfig(PretrainedConfig):
         self.sparse_num_local_blocks = sparse_num_local_blocks
         self.sparse_num_global_blocks = sparse_num_global_blocks
         self.sparse_num_different_global_patterns = sparse_num_different_global_patterns
+        self.attn_implementation = attn_implementation
 
         super().__init__(
             bos_token_id=bos_token_id,
